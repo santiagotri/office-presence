@@ -10,18 +10,28 @@ main{max-width:720px;margin:auto;padding:16px}h1{font-size:22px;margin:8px 0 4px
 .row{display:flex;align-items:center;gap:10px}.grow{flex:1}.dot{width:10px;height:10px;border-radius:50%;background:var(--line)}.on .dot{background:var(--ok)}
 .mut{color:var(--mut);font-size:13px}button,input{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
 button{cursor:pointer}button.pri{background:var(--fg);color:var(--bg);border:0}button.x{border:0;color:var(--mut);padding:4px 8px}
+.ok{color:var(--ok)}.ev{font-size:12px;margin:2px 0 6px 18px}select{font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
 form{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}form input{flex:1;min-width:120px}details summary{cursor:pointer}code{font-size:12px}
 </style></head><body><main>
 <div class="row"><h1 class="grow">Who's in</h1><span class="mut" id="ts"></span></div>
 <div id="present"></div>
 <h2>Profiles</h2><div id="profiles"></div>
 <form id="newp"><input name="name" placeholder="New person name" required><button class="pri">Add</button></form>
+<h2>Scan network</h2>
+<div class="row"><button class="pri" id="scanbtn" onclick="discover()">Scan now</button><span class="mut grow" id="scaninfo">Find every device visible on this LAN and add it to a profile.</span></div>
+<div id="scan"></div>
 <h2>Unknown devices</h2><div id="unknown" class="mut"></div>
 <p class="mut"><span id="keyinfo"></span> · <a href="/docs">API docs</a></p>
 </main><script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
 let KEY=localStorage.getItem('opkey')||'', profiles=[];
 const ago=t=>{if(!t)return'never';const s=Date.now()/1000-t;return s<60?'just now':s<3600?Math.round(s/60)+' min ago':s<86400?Math.round(s/3600)+' h ago':Math.round(s/86400)+' d ago'};
+const dur=s=>{s=Math.max(0,Math.round(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h`:h?`${h}h ${m}m`:m?`${m} min`:`${s}s`};
+const date=t=>t?new Date(t*1000).toLocaleString([], {dateStyle:'medium',timeStyle:'short'}):'—';
+function hist(d){const now=Date.now()/1000;if(!d.first_seen)return'<span class="mut">never seen</span>';
+ const st=d.present?`<span class="ok">present for ${dur(now-(d.arrived_at||d.last_seen))}</span>`:`missing for ${dur(now-d.last_seen)}`;
+ const ev=(d.events||[]).map(e=>`${e.kind=='arrive'?'↘ arrived':'↗ left'} ${date(e.ts)}`).join('<br>');
+ return `<span class="mut">first seen ${date(d.first_seen)} · </span>${st}${ev?`<details class="ev mut"><summary>history</summary>${ev}</details>`:''}`}
 async function api(m,u,b){const r=await fetch(u,{method:m,headers:{'Content-Type':'application/json','X-API-Key':KEY},body:b?JSON.stringify(b):undefined});
  if(r.status==401){KEY=prompt('API key required')||'';localStorage.setItem('opkey',KEY);return api(m,u,b)}
  if(!r.ok){alert((await r.json().catch(()=>({}))).detail||r.status);throw r}return r.status==204?null:r.json()}
@@ -31,7 +41,7 @@ async function load(){
  $('#ts').textContent='updated '+new Date().toLocaleTimeString();
  $('#present').innerHTML=p.present.length?p.present.map(x=>`<div class="card row on"><span class="dot"></span><b class="grow">${esc(x.name)}</b><span class="mut">${ago(x.last_seen)}</span></div>`).join(''):'<div class="card mut">Nobody detected right now.</div>';
  $('#profiles').innerHTML=profiles.map(x=>`<div class="card ${x.present?'on':''}"><details><summary class="row"><span class="dot"></span><b class="grow">${esc(x.name)}</b><span class="mut">${x.devices.length} dev · ${ago(x.last_seen)}</span></summary>
-  ${x.devices.map(d=>`<div class="row"><span class="grow">${esc(d.label||'device')} <code>${d.mac}</code> <span class="mut">${ago(d.last_seen)}</span></span><button class="x" onclick="delDev(${x.id},'${d.mac}')">✕</button></div>`).join('')}
+  ${x.devices.map(d=>`<div class="row"><span class="grow">${esc(d.label||'device')} <code>${d.mac}</code><br>${hist(d)}</span><button class="x" onclick="delDev(${x.id},'${d.mac}')">✕</button></div>`).join('')}
   <form onsubmit="addDev(event,${x.id})"><input name="mac" placeholder="MAC aa:bb:cc:dd:ee:ff" required><input name="label" placeholder="Label (phone, laptop)"><button>Add device</button></form>
   <p><button class="x" onclick="rename(${x.id},'${esc(x.name)}')">Rename</button><button class="x" onclick="delP(${x.id})">Delete profile</button></p></details></div>`).join('')||'<div class="card mut">No profiles yet.</div>';
  const opts=profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
@@ -42,6 +52,20 @@ async function delDev(id,mac){if(confirm('Remove device '+mac+'?')){await api('D
 async function delP(id){if(confirm('Delete profile?')){await api('DELETE',`/api/profiles/${id}`);load()}}
 async function rename(id,n){const name=prompt('New name',n);if(name){await api('PUT',`/api/profiles/${id}`,{name});load()}}
 async function assign(mac){const id=document.getElementById('s'+mac).value,label=prompt('Label for this device','phone')??'';await api('POST',`/api/profiles/${id}/devices`,{mac,label});load()}
+async function discover(){const b=$('#scanbtn');b.disabled=true;b.textContent='Scanning…';
+ try{const r=await api('POST','/api/discover');
+  $('#scaninfo').textContent=`${r.devices.length} devices on ${r.subnet} · ${new Date().toLocaleTimeString()}`;
+  const opts=profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
+  $('#scan').innerHTML=r.devices.map(d=>`<div class="card row"><input type="checkbox" class="pick" value="${d.mac}" ${d.profile_id?'disabled':''}>
+   <span class="grow"><code>${d.mac}</code> <span class="mut">${esc(d.ip)}${d.hostname?' · '+esc(d.hostname):''}${d.private_mac?' · private MAC':''} · first seen ${date(d.first_seen)}</span>
+   ${d.profile_id?`<br><span class="ok">${esc(d.profile_name)}${d.label?' · '+esc(d.label):''}</span>`:''}</span>
+   ${d.profile_id?'':`<input id="l${d.mac}" placeholder="Label" value="${esc((d.hostname||'').split('.')[0])}" style="width:120px">`}</div>`).join('')
+   +(profiles.length?`<form onsubmit="addPicked(event)"><select id="pickp">${opts}</select><button class="pri">Add selected to profile</button></form>`:'<p class="mut">Create a profile first to assign devices.</p>');
+ }finally{b.disabled=false;b.textContent='Scan now'}}
+async function addPicked(e){e.preventDefault();const id=$('#pickp').value,macs=[...document.querySelectorAll('.pick:checked')].map(c=>c.value);
+ if(!macs.length)return alert('Select at least one device');
+ for(const mac of macs)await api('POST',`/api/profiles/${id}/devices`,{mac,label:document.getElementById('l'+mac)?.value||''});
+ await load();discover()}
 $('#newp').onsubmit=async e=>{e.preventDefault();await api('POST','/api/profiles',{name:e.target.name.value});e.target.reset();load()};
 fetch('/health').then(r=>r.json()).then(h=>$('#keyinfo').textContent=h.auth_required?'Editing requires API key':'Open editing (no API key set)');
 load();setInterval(load,15000);

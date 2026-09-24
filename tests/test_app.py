@@ -12,11 +12,17 @@ def fake_scan(settings):
     return dict(FOUND)
 
 
+def fake_discover(settings, subnet=""):
+    return {"subnet": subnet or "10.0.0.0/24",
+            "devices": [{"mac": m, "ip": ip, "hostname": "", "private_mac": scanner.is_private_mac(m)}
+                        for m, ip in FOUND.items()]}
+
+
 @pytest.fixture
 def client(tmp_path):
     FOUND.clear()
     s = Settings(db_path=str(tmp_path / "t.db"), scanner_enabled=False, present_timeout=300)
-    app = create_app(s, scan_fn=fake_scan)
+    app = create_app(s, scan_fn=fake_scan, discover_fn=fake_discover)
     with TestClient(app) as c:
         c.app_ref = app
         yield c
@@ -78,3 +84,33 @@ def test_api_key(tmp_path):
         assert c.post("/api/profiles", json={"name": "X"}, headers={"X-API-Key": "s3cret"}).status_code == 201
         assert c.get("/api/presence").status_code == 200
         assert c.get("/health").json()["auth_required"] is True
+
+
+def test_discover_and_assign(client):
+    pid = client.post("/api/profiles", json={"name": "Cy"}).json()["id"]
+    FOUND.update({"a8:bb:cc:dd:ee:10": "10.0.0.10", "da:bb:cc:dd:ee:11": "10.0.0.11"})
+    r = client.post("/api/discover").json()
+    assert r["subnet"] == "10.0.0.0/24"
+    devs = {d["mac"]: d for d in r["devices"]}
+    assert devs["da:bb:cc:dd:ee:11"]["private_mac"] and not devs["a8:bb:cc:dd:ee:10"]["private_mac"]
+    assert devs["a8:bb:cc:dd:ee:10"]["profile_id"] is None and devs["a8:bb:cc:dd:ee:10"]["first_seen"]
+    client.post(f"/api/profiles/{pid}/devices", json={"mac": "a8:bb:cc:dd:ee:10", "label": "phone"})
+    r = client.post("/api/discover", json={"subnet": "10.0.0.0/24"}).json()
+    d = next(x for x in r["devices"] if x["mac"] == "a8:bb:cc:dd:ee:10")
+    assert (d["profile_id"], d["profile_name"], d["label"]) == (pid, "Cy", "phone")
+    assert client.get(f"/api/profiles/{pid}").json()["present"] is True
+
+
+def test_history(client):
+    db, mac, t0 = client.app_ref.state.db, "aa:bb:cc:dd:ee:20", time.time() - 10000
+    db.record({mac: "10.0.0.20"}, now=t0, timeout=300)
+    db.record({mac: "10.0.0.20"}, now=t0 + 100, timeout=300)   # still here: no new event
+    db.record({}, now=t0 + 1000, timeout=300)                   # gone -> depart at last sighting
+    db.record({mac: "10.0.0.21"}, now=t0 + 5000, timeout=300)  # back -> arrive
+    h = client.get(f"/api/devices/{mac.upper()}/history").json()
+    assert [(e["kind"], round(e["ts"] - t0)) for e in h["events"]] == [("arrive", 5000), ("depart", 100), ("arrive", 0)]
+    assert round(h["first_seen"] - t0) == 0 and h["present"] is False and h["arrived_at"] is None
+    db.record({mac: "10.0.0.21"}, timeout=300)
+    h = client.get(f"/api/devices/{mac}/history").json()
+    assert h["present"] is True and h["arrived_at"] == pytest.approx(time.time(), abs=5)  # gap > timeout = new visit
+    assert h["events"][0]["kind"] == "arrive" and len(h["events"]) == 5

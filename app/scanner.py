@@ -4,6 +4,7 @@ import logging
 import platform
 import re
 import shutil
+import socket
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,9 +65,62 @@ def _run(cmd):
 
 
 def read_neighbors() -> dict[str, str]:
+    found = {}
     if platform.system() == "Linux" and shutil.which("ip"):
-        return parse_ip_neigh(_run(["ip", "neigh", "show"]))
-    return parse_arp_an(_run(["arp", "-an"]))
+        found = parse_ip_neigh(_run(["ip", "neigh", "show"]))
+    if not found and shutil.which("arp"):  # macOS, or Linux without iproute2
+        found = parse_arp_an(_run(["arp", "-an"]))
+    return found
+
+
+def local_ip() -> str:
+    """IP of the interface holding the default route (no packet is actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def detect_subnet() -> str:
+    """Best-effort local LAN CIDR. Uses `ip` on Linux for the real prefix, else assumes /24."""
+    ip = local_ip()
+    if platform.system() == "Linux" and shutil.which("ip"):
+        m = re.search(rf"inet {re.escape(ip)}/(\d+)", _run(["ip", "-o", "-4", "addr", "show"]))
+        if m and 22 <= int(m.group(1)) <= 30:
+            return str(ipaddress.ip_network(f"{ip}/{m.group(1)}", strict=False))
+    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+
+
+def is_private_mac(mac: str) -> bool:
+    """Locally administered bit set -> randomized/private MAC (phones, laptops)."""
+    return bool(int(mac.split(":")[0], 16) & 0x02)
+
+
+def _hostname(ip: str) -> str:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def discover(settings, subnet: str = "") -> dict:
+    """Active scan: ping-sweep the LAN, then read the neighbor table.
+
+    Returns {"subnet": cidr, "devices": [{mac, ip, hostname, private_mac}]}."""
+    subnet = subnet or settings.subnet or detect_subnet()
+    found = scapy_scan(subnet) if settings.use_scapy else {}
+    ping_sweep(subnet)
+    found.update(read_neighbors())
+    net = ipaddress.ip_network(subnet, strict=False)
+    found = {m: ip for m, ip in found.items() if ipaddress.ip_address(ip) in net}
+    with ThreadPoolExecutor(32) as ex:
+        names = dict(zip(found, ex.map(_hostname, found.values())))
+    devs = [{"mac": m, "ip": ip, "hostname": names[m], "private_mac": is_private_mac(m)}
+            for m, ip in found.items()]
+    devs.sort(key=lambda d: tuple(int(x) for x in d["ip"].split(".")))
+    return {"subnet": subnet, "devices": devs}
 
 
 def ping_sweep(subnet: str, workers: int = 64):

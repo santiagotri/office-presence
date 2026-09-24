@@ -36,15 +36,20 @@ class ProfileUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
-def create_app(settings: Optional[Settings] = None, scan_fn=None) -> FastAPI:
+class DiscoverIn(BaseModel):
+    subnet: str = Field("", examples=["192.168.1.0/24"], description="Empty = OP_SUBNET or auto-detect")
+
+
+def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=None) -> FastAPI:
     settings = settings or Settings()
     scan_fn = scan_fn or scanner.scan
+    discover_fn = discover_fn or scanner.discover
     db = DB(settings.db_path)
     state = {"last_scan": None, "last_error": None}
 
     def do_scan():
         try:
-            db.record(scan_fn(settings))
+            db.record(scan_fn(settings), timeout=settings.present_timeout)
             state["last_scan"], state["last_error"] = time.time(), None
         except Exception as e:  # noqa: BLE001
             state["last_error"] = str(e)
@@ -70,17 +75,23 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None) -> FastAPI:
         if settings.api_key and x_api_key != settings.api_key:
             raise HTTPException(401, "invalid or missing X-API-Key")
 
-    def seen(mac):
-        r = db.q("SELECT ip, last_seen FROM sightings WHERE mac=?", (mac,)).fetchone()
-        return (r["ip"], r["last_seen"]) if r else (None, None)
+    def device_info(mac, now, limit=0):
+        s, events = db.history(mac, limit) if limit else (
+            db.q("SELECT * FROM sightings WHERE mac=?", (mac,)).fetchone(), [])
+        last = s["last_seen"] if s else None
+        present = bool(last and now - last <= settings.present_timeout)
+        out = {"ip": s["ip"] if s else None, "first_seen": s["first_seen"] if s else None,
+               "last_seen": last, "present": present,
+               "arrived_at": s["arrived_at"] if s and present else None}
+        if limit:
+            out["events"] = events
+        return out
 
     def profile_out(p):
         now = time.time()
         devs = []
         for d in db.q("SELECT mac, label FROM devices WHERE profile_id=? ORDER BY mac", (p["id"],)):
-            ip, last = seen(d["mac"])
-            devs.append({"mac": d["mac"], "label": d["label"], "ip": ip, "last_seen": last,
-                         "present": bool(last and now - last <= settings.present_timeout)})
+            devs.append({"mac": d["mac"], "label": d["label"], **device_info(d["mac"], now, 10)})
         lasts = [d["last_seen"] for d in devs if d["last_seen"]]
         return {"id": p["id"], "name": p["name"], "present": any(d["present"] for d in devs),
                 "last_seen": max(lasts) if lasts else None, "devices": devs}
@@ -117,6 +128,35 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None) -> FastAPI:
     async def scan_now():
         await asyncio.to_thread(do_scan)
         return {"last_scan": state["last_scan"], "last_error": state["last_error"]}
+
+    @app.post("/api/discover", tags=["devices"], dependencies=[Depends(require_key)])
+    async def discover(body: Optional[DiscoverIn] = None):
+        """Actively scan the LAN now and list every visible device, with its current owner if any."""
+        try:
+            res = await asyncio.to_thread(discover_fn, settings, body.subnet if body else "")
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"scan failed: {e}")
+        db.record({d["mac"]: d["ip"] for d in res["devices"]}, timeout=settings.present_timeout)
+        owners = {r["mac"]: (r["profile_id"], r["name"], r["label"]) for r in db.q(
+            "SELECT d.mac, d.profile_id, d.label, p.name FROM devices d JOIN profiles p ON p.id=d.profile_id")}
+        for d in res["devices"]:
+            o = owners.get(d["mac"])
+            d["profile_id"], d["profile_name"], d["label"] = o if o else (None, None, "")
+            d["first_seen"] = db.q("SELECT first_seen FROM sightings WHERE mac=?", (d["mac"],)).fetchone()[0]
+        return {"timestamp": time.time(), **res}
+
+    @app.get("/api/devices/{mac}/history", tags=["devices"])
+    def device_history(mac: str, limit: int = 50):
+        """first_seen / last_seen / arrived_at plus the arrival & departure event log (newest first)."""
+        try:
+            mac = scanner.normalize_mac(mac)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        if not db.q("SELECT 1 FROM sightings WHERE mac=?", (mac,)).fetchone():
+            raise HTTPException(404, "device never seen")
+        return {"mac": mac, **device_info(mac, time.time(), max(1, min(limit, 500)))}
 
     @app.get("/api/profiles", tags=["profiles"])
     def list_profiles():

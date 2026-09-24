@@ -18,7 +18,16 @@ OP_SUBNET=192.168.1.0/24 .venv/bin/uvicorn app.main:create_app --factory --host 
 ```
 UI: `http://<machine>:8000/` · Swagger: `/docs` · OpenAPI JSON: `/openapi.json`.
 
-Register people: create a profile, then open "Unknown devices" and assign the MACs you see, or type a MAC.
+Register people: create a profile, then hit **Scan now** (section "Scan network"). It ping-sweeps the
+LAN (`OP_SUBNET`, or auto-detected from the default-route interface, /24 if unknown), reads the ARP table
+and lists every visible device with IP, reverse-DNS hostname, a "private MAC" flag and its current owner.
+Tick the devices, pick a profile, "Add selected". You can still assign from "Unknown devices" or type a MAC.
+
+## Device history
+Every sighting updates `first_seen` / `last_seen`. A device **arrives** when seen after being absent
+(or for the first time) and **departs** when unseen for more than `OP_PRESENT_TIMEOUT` (stamped at its
+last sighting). The UI shows per device: *first seen <date>*, *present for <time since arrival>* or
+*missing for <time since last seen>*, and an expandable event log.
 
 ## Config (env vars)
 | Var | Default | Meaning |
@@ -26,7 +35,7 @@ Register people: create a profile, then open "Unknown devices" and assign the MA
 | `OP_DB_PATH` | `presence.db` | SQLite file |
 | `OP_SCAN_INTERVAL` | `30` | seconds between scans |
 | `OP_PRESENT_TIMEOUT` | `300` | seconds since last sighting to count as present |
-| `OP_SUBNET` | *(empty)* | CIDR to sweep, e.g. `192.168.1.0/24` (max /22). Empty = only read ARP table |
+| `OP_SUBNET` | *(empty)* | CIDR to sweep, e.g. `192.168.1.0/24` (max /22). Empty = background scans only read the ARP table; **Scan now** auto-detects |
 | `OP_PING_SWEEP` | `1` | ping every host in `OP_SUBNET` before reading the table |
 | `OP_USE_SCAPY` | `0` | active ARP scan (`pip install scapy`, needs root) |
 | `OP_API_KEY` | *(empty)* | if set, all write endpoints require header `X-API-Key` |
@@ -41,6 +50,8 @@ Register people: create a profile, then open "Unknown devices" and assign the MA
 - `GET|POST /api/profiles`, `GET|PUT|DELETE /api/profiles/{id}`
 - `POST /api/profiles/{id}/devices` `{mac, label}`, `DELETE /api/profiles/{id}/devices/{mac}`
 - `GET /api/devices/unknown?since=<seconds>` – seen MACs not assigned to anyone
+- `POST /api/discover` `{subnet?}` – active LAN scan now → `{subnet, devices: [{mac, ip, hostname, private_mac, first_seen, profile_id, profile_name, label}]}`
+- `GET /api/devices/{mac}/history?limit=50` – `first_seen`, `last_seen`, `present`, `arrived_at`, `events: [{kind: arrive|depart, ts}]`
 
 MACs are accepted in any common format and stored as `aa:bb:cc:dd:ee:ff`.
 
