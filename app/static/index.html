@@ -31,7 +31,7 @@ const date=t=>t?new Date(t*1000).toLocaleString([], {dateStyle:'medium',timeStyl
 function hist(d){const now=Date.now()/1000;if(!d.first_seen)return'<span class="mut">never seen</span>';
  const st=d.present?`<span class="ok">present for ${dur(now-(d.arrived_at||d.last_seen))}</span>`:`missing for ${dur(now-d.last_seen)}`;
  const ev=(d.events||[]).map(e=>`${e.kind=='arrive'?'↘ arrived':'↗ left'} ${date(e.ts)}`).join('<br>');
- return `<span class="mut">first seen ${date(d.first_seen)} · </span>${st}${ev?`<details class="ev mut"><summary>history</summary>${ev}</details>`:''}`}
+ return `<span class="mut">first seen ${date(d.first_seen)} · last seen ${d.last_seen?date(d.last_seen):"never"} · </span>${st}${ev?`<details class="ev mut"><summary>history</summary>${ev}</details>`:''}`}
 async function api(m,u,b){const r=await fetch(u,{method:m,headers:{'Content-Type':'application/json','X-API-Key':KEY},body:b?JSON.stringify(b):undefined});
  if(r.status==401){KEY=prompt('API key required')||'';localStorage.setItem('opkey',KEY);return api(m,u,b)}
  if(!r.ok){alert((await r.json().catch(()=>({}))).detail||r.status);throw r}return r.status==204?null:r.json()}
