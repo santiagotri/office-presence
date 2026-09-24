@@ -147,6 +147,8 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
             raise HTTPException(422, str(e))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"scan failed: {e}")
+        skip = db.ignored_macs()
+        res["devices"] = [d for d in res["devices"] if d["mac"] not in skip]
         db.record({d["mac"]: d["ip"] for d in res["devices"]}, timeout=settings.present_timeout)
         owners = {r["mac"]: (r["profile_id"], r["name"], r["label"]) for r in db.q(
             "SELECT d.mac, d.profile_id, d.label, p.name FROM devices d JOIN profiles p ON p.id=d.profile_id")}
@@ -171,6 +173,37 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
         else:
             db.q("DELETE FROM aliases WHERE mac=?", (mac,))
         return {"mac": mac, "name": name}
+
+    def mac_or_422(mac):
+        try:
+            return scanner.normalize_mac(mac)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
+    @app.delete("/api/devices/{mac}", tags=["devices"], status_code=204, dependencies=[Depends(require_key)])
+    def forget_device(mac: str, ignore: bool = False):
+        """Delete an unassigned device: its sightings, events and name. It reappears fresh if seen
+        again, unless `ignore=true`, which also hides it from scans until un-ignored."""
+        mac = mac_or_422(mac)
+        owner = db.q("SELECT profile_id FROM devices WHERE mac=?", (mac,)).fetchone()
+        if owner:
+            raise HTTPException(409, f"MAC {mac} belongs to profile {owner['profile_id']}; remove it there first")
+        name = alias(mac)
+        if not db.forget(mac) and not ignore:
+            raise HTTPException(404, "device not found")
+        if ignore:
+            db.q("INSERT OR REPLACE INTO ignored(mac, name, ignored_at) VALUES(?,?,?)", (mac, name, time.time()))
+
+    @app.get("/api/devices/ignored", tags=["devices"])
+    def ignored_devices():
+        """MACs hidden permanently; skipped by scans, discover and the unknown list."""
+        return [dict(r) for r in db.q("SELECT mac, name, ignored_at FROM ignored ORDER BY ignored_at DESC")]
+
+    @app.delete("/api/devices/ignored/{mac}", tags=["devices"], status_code=204, dependencies=[Depends(require_key)])
+    def unignore_device(mac: str):
+        mac = mac_or_422(mac)
+        if db.q("DELETE FROM ignored WHERE mac=?", (mac,)).rowcount == 0:
+            raise HTTPException(404, "MAC not ignored")
 
     @app.get("/api/devices/{mac}/history", tags=["devices"])
     def device_history(mac: str, limit: int = 50):
@@ -238,7 +271,8 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
         """MACs seen on the network not assigned to any profile. `since` = seconds back (default: present timeout x 12)."""
         cutoff = time.time() - (since or settings.present_timeout * 12)
         rows = db.q("""SELECT s.mac, COALESCE(a.name, '') AS name, s.ip, s.first_seen, s.last_seen
-                       FROM sightings s LEFT JOIN devices d ON d.mac=s.mac LEFT JOIN aliases a ON a.mac=s.mac WHERE d.mac IS NULL AND s.last_seen>=?
+                       FROM sightings s LEFT JOIN devices d ON d.mac=s.mac LEFT JOIN aliases a ON a.mac=s.mac
+                       WHERE d.mac IS NULL AND s.mac NOT IN (SELECT mac FROM ignored) AND s.last_seen>=?
                        ORDER BY s.last_seen DESC""", (cutoff,))
         return [dict(r) for r in rows]
 

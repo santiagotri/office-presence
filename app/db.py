@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS sightings (
   mac TEXT PRIMARY KEY, ip TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT NOT NULL, kind TEXT NOT NULL, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS ignored (
+  mac TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', ignored_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS events_mac_ts ON events(mac, ts);
 """
 
@@ -44,7 +46,10 @@ class DB:
         longer than `timeout`). It *departs* when not seen for more than `timeout`; the departure
         is stamped at its last sighting."""
         now = now or time.time()
+        skip = self.ignored_macs()
         for mac, ip in found.items():
+            if mac in skip:
+                continue
             r = self.q("SELECT last_seen, present FROM sightings WHERE mac=?", (mac,)).fetchone()
             if r and r["present"] and timeout and now - r["last_seen"] > timeout:
                 self.q("INSERT INTO events(mac, kind, ts) VALUES(?, 'depart', ?)", (mac, r["last_seen"]))
@@ -62,6 +67,16 @@ class DB:
                             (now - timeout,)).fetchall():
                 self.q("INSERT INTO events(mac, kind, ts) VALUES(?, 'depart', ?)", (r["mac"], r["last_seen"]))
                 self.q("UPDATE sightings SET present=0 WHERE mac=?", (r["mac"],))
+
+    def ignored_macs(self):
+        return {r[0] for r in self.q("SELECT mac FROM ignored")}
+
+    def forget(self, mac):
+        """Drop everything recorded about a MAC (sightings, events, alias)."""
+        n = self.q("DELETE FROM sightings WHERE mac=?", (mac,)).rowcount
+        n += self.q("DELETE FROM events WHERE mac=?", (mac,)).rowcount
+        n += self.q("DELETE FROM aliases WHERE mac=?", (mac,)).rowcount
+        return n
 
     def history(self, mac, limit=20):
         s = self.q("SELECT * FROM sightings WHERE mac=?", (mac,)).fetchone()

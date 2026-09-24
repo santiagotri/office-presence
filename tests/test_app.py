@@ -149,3 +149,59 @@ def test_aliases_migration(tmp_path):
     app = create_app(Settings(db_path=str(p), scanner_enabled=False), scan_fn=fake_scan, discover_fn=fake_discover)
     with TestClient(app) as cl:
         assert cl.put("/api/devices/aa:bb:cc:dd:ee:01/name", json={"name": "x"}).status_code == 200
+
+
+def test_delete_unknown_device(client):
+    mac = "aa:bb:cc:dd:ee:88"
+    FOUND[mac] = "10.0.0.88"
+    client.post("/api/scan")
+    client.put(f"/api/devices/{mac}/name", json={"name": "Toaster"})
+    assert client.delete("/api/devices/AA-BB-CC-DD-EE-88").status_code == 204
+    assert client.get("/api/devices/unknown").json() == []
+    assert client.get(f"/api/devices/{mac}/history").status_code == 404
+    assert client.delete(f"/api/devices/{mac}").status_code == 404
+    assert client.delete("/api/devices/nope").status_code == 422
+    # reappears fresh on next scan
+    client.post("/api/scan")
+    u = client.get("/api/devices/unknown").json()
+    assert [(d["mac"], d["name"]) for d in u] == [(mac, "")]
+    assert [e["kind"] for e in client.get(f"/api/devices/{mac}/history").json()["events"]] == ["arrive"]
+    # assigned devices are protected
+    pid = client.post("/api/profiles", json={"name": "Ana", "devices": [{"mac": mac}]}).json()["id"]
+    assert client.delete(f"/api/devices/{mac}").status_code == 409
+    assert client.get(f"/api/profiles/{pid}").json()["devices"][0]["first_seen"]
+
+
+def test_ignore_device(client):
+    mac, other = "aa:bb:cc:dd:ee:99", "aa:bb:cc:dd:ee:98"
+    FOUND.update({mac: "10.0.0.99", other: "10.0.0.98"})
+    client.post("/api/scan")
+    client.put(f"/api/devices/{mac}/name", json={"name": "TV"})
+    assert client.delete(f"/api/devices/{mac}?ignore=true").status_code == 204
+    ig = client.get("/api/devices/ignored").json()
+    assert [(d["mac"], d["name"]) for d in ig] == [(mac, "TV")]
+    client.post("/api/scan")
+    assert [d["mac"] for d in client.get("/api/devices/unknown").json()] == [other]
+    assert [d["mac"] for d in client.post("/api/discover").json()["devices"]] == [other]
+    assert client.get(f"/api/devices/{mac}/history").status_code == 404
+    # un-ignore: seen again on next scan
+    assert client.delete(f"/api/devices/ignored/{mac}").status_code == 204
+    assert client.delete(f"/api/devices/ignored/{mac}").status_code == 404
+    client.post("/api/scan")
+    assert {d["mac"] for d in client.get("/api/devices/unknown").json()} == {mac, other}
+    # ignoring a never-seen MAC is allowed
+    assert client.delete("/api/devices/aa:bb:cc:dd:ee:00?ignore=true").status_code == 204
+
+
+def test_ignored_migration(tmp_path):
+    import sqlite3
+    p = tmp_path / "old.db"
+    c = sqlite3.connect(p)
+    c.executescript("CREATE TABLE profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);"
+                    "CREATE TABLE sightings (mac TEXT PRIMARY KEY, ip TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL);"
+                    "INSERT INTO sightings VALUES('aa:bb:cc:dd:ee:01','10.0.0.1',1,1);")
+    c.close()
+    app = create_app(Settings(db_path=str(p), scanner_enabled=False), scan_fn=fake_scan, discover_fn=fake_discover)
+    with TestClient(app) as cl:
+        assert cl.delete("/api/devices/aa:bb:cc:dd:ee:01?ignore=true").status_code == 204
+        assert cl.get("/api/devices/ignored").json()[0]["mac"] == "aa:bb:cc:dd:ee:01"

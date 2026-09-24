@@ -50,6 +50,8 @@ last sighting). The UI shows per device: *first seen <date>*, *present for <time
 - `GET|POST /api/profiles`, `GET|PUT|DELETE /api/profiles/{id}`
 - `POST /api/profiles/{id}/devices` `{mac, label}`, `DELETE /api/profiles/{id}/devices/{mac}`
 - `GET /api/devices/unknown?since=<seconds>` – seen MACs not assigned to anyone
+- `DELETE /api/devices/{mac}?ignore=false` – forget an unassigned MAC (sightings, events, name); 409 if assigned. `ignore=true` hides it from scans
+- `GET /api/devices/ignored`, `DELETE /api/devices/ignored/{mac}` – list / un-ignore
 - `POST /api/discover` `{subnet?}` – active LAN scan now → `{subnet, devices: [{mac, ip, hostname, private_mac, first_seen, profile_id, profile_name, label}]}`
 - `GET /api/devices/{mac}/history?limit=50` – `first_seen`, `last_seen`, `present`, `arrived_at`, `events: [{kind: arrive|depart, ts}]`
 

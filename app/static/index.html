@@ -21,6 +21,7 @@ form{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}form input{flex:1;min-wi
 <div class="row"><button class="pri" id="scanbtn" onclick="discover()">Scan now</button><span class="mut grow" id="scaninfo">Find every device visible on this LAN and add it to a profile.</span></div>
 <div id="scan"></div>
 <h2>Unknown devices</h2><div id="unknown" class="mut"></div>
+<div id="ignwrap" hidden><h2>Ignored</h2><div id="ignored"></div></div>
 <p class="mut"><span id="keyinfo"></span> · <a href="/docs">API docs</a></p>
 </main><script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
@@ -36,7 +37,7 @@ async function api(m,u,b){const r=await fetch(u,{method:m,headers:{'Content-Type
  if(r.status==401){KEY=prompt('API key required')||'';localStorage.setItem('opkey',KEY);return api(m,u,b)}
  if(!r.ok){alert((await r.json().catch(()=>({}))).detail||r.status);throw r}return r.status==204?null:r.json()}
 async function load(){
- const [p,u]=await Promise.all([api('GET','/api/presence'),api('GET','/api/devices/unknown')]);
+ const [p,u,ig]=await Promise.all([api('GET','/api/presence'),api('GET','/api/devices/unknown'),api('GET','/api/devices/ignored')]);
  profiles=[...p.present,...p.absent].sort((a,b)=>a.name.localeCompare(b.name));
  $('#ts').textContent='updated '+new Date().toLocaleTimeString();
  $('#present').innerHTML=p.present.length?p.present.map(x=>`<div class="card row on"><span class="dot"></span><b class="grow">${esc(x.name)}</b><span class="mut">${ago(x.last_seen)}</span></div>`).join(''):'<div class="card mut">Nobody detected right now.</div>';
@@ -46,10 +47,16 @@ async function load(){
   <p><button class="x" onclick="rename(${x.id},'${esc(x.name)}')">Rename</button><button class="x" onclick="delP(${x.id})">Delete profile</button></p></details></div>`).join('')||'<div class="card mut">No profiles yet.</div>';
  u_names=Object.fromEntries(u.map(d=>[d.mac,d.name]));
  const opts=profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
- $('#unknown').innerHTML=u.length?u.map(d=>`<div class="card row"><span class="grow">${nm(d)}<code>${d.mac}</code> <span class="mut">${esc(d.ip)} · ${ago(d.last_seen)}</span></span>${profiles.length?`<select id="s${d.mac}">${opts}</select><button onclick="assign('${d.mac}')">Assign</button>`:''}</div>`).join(''):'None seen recently.';
+ $('#unknown').innerHTML=u.length?u.map(d=>`<div class="card row"><span class="grow">${nm(d)}<code>${d.mac}</code> <span class="mut">${esc(d.ip)} · ${ago(d.last_seen)}</span></span>${profiles.length?`<select id="s${d.mac}">${opts}</select><button onclick="assign('${d.mac}')">Assign</button>`:''}<button class="x" title="Delete device" onclick="forget('${d.mac}')">✕</button></div>`).join(''):'None seen recently.';
+ $('#ignwrap').hidden=!ig.length;
+ $('#ignored').innerHTML=ig.map(d=>`<div class="card row"><span class="grow">${d.name?`<b>${esc(d.name)}</b> `:''}<code>${d.mac}</code> <span class="mut">ignored ${ago(d.ignored_at)}</span></span><button class="x" onclick="unignore('${d.mac}')">Un-ignore</button></div>`).join('');
 }
 const nm=d=>`${d.name?`<b>${esc(d.name)}</b> `:''}<button class="x" title="Name this device" onclick="setName('${d.mac}','${esc(d.name||'')}')">${d.name?'✎':'✎ name'}</button> `;
 async function setName(mac,n){const name=prompt('Device name (empty clears)',n);if(name!==null){await api('PUT',`/api/devices/${mac}/name`,{name});load();if($('#scan').innerHTML)discover()}}
+async function forget(mac){if(!confirm('Delete device '+mac+' and its history?'))return;
+ const ignore=confirm('Also ignore '+mac+' permanently?\nOK = hide it from future scans · Cancel = let it reappear if seen again');
+ await api('DELETE',`/api/devices/${mac}${ignore?'?ignore=true':''}`);load()}
+async function unignore(mac){await api('DELETE',`/api/devices/ignored/${mac}`);load()}
 async function addDev(e,id){e.preventDefault();const f=new FormData(e.target);await api('POST',`/api/profiles/${id}/devices`,{mac:f.get('mac'),label:f.get('label')});load()}
 async function delDev(id,mac){if(confirm('Remove device '+mac+'?')){await api('DELETE',`/api/profiles/${id}/devices/${mac}`);load()}}
 async function delP(id){if(confirm('Delete profile?')){await api('DELETE',`/api/profiles/${id}`);load()}}
