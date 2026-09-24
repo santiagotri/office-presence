@@ -114,3 +114,38 @@ def test_history(client):
     h = client.get(f"/api/devices/{mac}/history").json()
     assert h["present"] is True and h["arrived_at"] == pytest.approx(time.time(), abs=5)  # gap > timeout = new visit
     assert h["events"][0]["kind"] == "arrive" and len(h["events"]) == 5
+
+
+def test_name_unassigned_device(client):
+    mac = "aa:bb:cc:dd:ee:77"
+    FOUND[mac] = "10.0.0.77"
+    client.post("/api/scan")
+    r = client.put("/api/devices/AA-BB-CC-DD-EE-77/name", json={"name": " Printer "})
+    assert r.status_code == 200 and r.json() == {"mac": mac, "name": "Printer"}
+    u = client.get("/api/devices/unknown").json()
+    assert [(d["mac"], d["name"]) for d in u] == [(mac, "Printer")]
+    assert client.post("/api/discover").json()["devices"][0]["name"] == "Printer"
+    assert client.get(f"/api/devices/{mac}/history").json()["name"] == "Printer"
+    # still assignable later, keeps its name (and uses it as default label)
+    pid = client.post("/api/profiles", json={"name": "Office"}).json()["id"]
+    dev = client.post(f"/api/profiles/{pid}/devices", json={"mac": mac}).json()["devices"][0]
+    assert dev["name"] == "Printer" and dev["label"] == "Printer"
+    assert client.get("/api/devices/unknown").json() == []
+    client.delete(f"/api/profiles/{pid}/devices/{mac}")
+    assert client.get("/api/devices/unknown").json()[0]["name"] == "Printer"
+    # clear
+    assert client.put(f"/api/devices/{mac}/name", json={"name": ""}).json()["name"] == ""
+    assert client.get("/api/devices/unknown").json()[0]["name"] == ""
+    assert client.put("/api/devices/nope/name", json={"name": "x"}).status_code == 422
+
+
+def test_aliases_migration(tmp_path):
+    import sqlite3
+    p = tmp_path / "old.db"
+    c = sqlite3.connect(p)
+    c.executescript("CREATE TABLE profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);"
+                    "CREATE TABLE sightings (mac TEXT PRIMARY KEY, ip TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL);")
+    c.close()
+    app = create_app(Settings(db_path=str(p), scanner_enabled=False), scan_fn=fake_scan, discover_fn=fake_discover)
+    with TestClient(app) as cl:
+        assert cl.put("/api/devices/aa:bb:cc:dd:ee:01/name", json={"name": "x"}).status_code == 200

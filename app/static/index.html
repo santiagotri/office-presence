@@ -24,7 +24,7 @@ form{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}form input{flex:1;min-wi
 <p class="mut"><span id="keyinfo"></span> · <a href="/docs">API docs</a></p>
 </main><script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
-let KEY=localStorage.getItem('opkey')||'', profiles=[];
+let u_names={}, KEY=localStorage.getItem('opkey')||'', profiles=[];
 const ago=t=>{if(!t)return'never';const s=Date.now()/1000-t;return s<60?'just now':s<3600?Math.round(s/60)+' min ago':s<86400?Math.round(s/3600)+' h ago':Math.round(s/86400)+' d ago'};
 const dur=s=>{s=Math.max(0,Math.round(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h`:h?`${h}h ${m}m`:m?`${m} min`:`${s}s`};
 const date=t=>t?new Date(t*1000).toLocaleString([], {dateStyle:'medium',timeStyle:'short'}):'—';
@@ -41,25 +41,28 @@ async function load(){
  $('#ts').textContent='updated '+new Date().toLocaleTimeString();
  $('#present').innerHTML=p.present.length?p.present.map(x=>`<div class="card row on"><span class="dot"></span><b class="grow">${esc(x.name)}</b><span class="mut">${ago(x.last_seen)}</span></div>`).join(''):'<div class="card mut">Nobody detected right now.</div>';
  $('#profiles').innerHTML=profiles.map(x=>`<div class="card ${x.present?'on':''}"><details><summary class="row"><span class="dot"></span><b class="grow">${esc(x.name)}</b><span class="mut">${x.devices.length} dev · ${ago(x.last_seen)}</span></summary>
-  ${x.devices.map(d=>`<div class="row"><span class="grow">${esc(d.label||'device')} <code>${d.mac}</code><br>${hist(d)}</span><button class="x" onclick="delDev(${x.id},'${d.mac}')">✕</button></div>`).join('')}
+  ${x.devices.map(d=>`<div class="row"><span class="grow">${esc(d.label||d.name||'device')} <code>${d.mac}</code><br>${hist(d)}</span><button class="x" onclick="delDev(${x.id},'${d.mac}')">✕</button></div>`).join('')}
   <form onsubmit="addDev(event,${x.id})"><input name="mac" placeholder="MAC aa:bb:cc:dd:ee:ff" required><input name="label" placeholder="Label (phone, laptop)"><button>Add device</button></form>
   <p><button class="x" onclick="rename(${x.id},'${esc(x.name)}')">Rename</button><button class="x" onclick="delP(${x.id})">Delete profile</button></p></details></div>`).join('')||'<div class="card mut">No profiles yet.</div>';
+ u_names=Object.fromEntries(u.map(d=>[d.mac,d.name]));
  const opts=profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
- $('#unknown').innerHTML=u.length?u.map(d=>`<div class="card row"><span class="grow"><code>${d.mac}</code> <span class="mut">${esc(d.ip)} · ${ago(d.last_seen)}</span></span>${profiles.length?`<select id="s${d.mac}">${opts}</select><button onclick="assign('${d.mac}')">Assign</button>`:''}</div>`).join(''):'None seen recently.';
+ $('#unknown').innerHTML=u.length?u.map(d=>`<div class="card row"><span class="grow">${nm(d)}<code>${d.mac}</code> <span class="mut">${esc(d.ip)} · ${ago(d.last_seen)}</span></span>${profiles.length?`<select id="s${d.mac}">${opts}</select><button onclick="assign('${d.mac}')">Assign</button>`:''}</div>`).join(''):'None seen recently.';
 }
+const nm=d=>`${d.name?`<b>${esc(d.name)}</b> `:''}<button class="x" title="Name this device" onclick="setName('${d.mac}','${esc(d.name||'')}')">${d.name?'✎':'✎ name'}</button> `;
+async function setName(mac,n){const name=prompt('Device name (empty clears)',n);if(name!==null){await api('PUT',`/api/devices/${mac}/name`,{name});load();if($('#scan').innerHTML)discover()}}
 async function addDev(e,id){e.preventDefault();const f=new FormData(e.target);await api('POST',`/api/profiles/${id}/devices`,{mac:f.get('mac'),label:f.get('label')});load()}
 async function delDev(id,mac){if(confirm('Remove device '+mac+'?')){await api('DELETE',`/api/profiles/${id}/devices/${mac}`);load()}}
 async function delP(id){if(confirm('Delete profile?')){await api('DELETE',`/api/profiles/${id}`);load()}}
 async function rename(id,n){const name=prompt('New name',n);if(name){await api('PUT',`/api/profiles/${id}`,{name});load()}}
-async function assign(mac){const id=document.getElementById('s'+mac).value,label=prompt('Label for this device','phone')??'';await api('POST',`/api/profiles/${id}/devices`,{mac,label});load()}
+async function assign(mac){const id=document.getElementById('s'+mac).value,label=prompt('Label for this device',u_names[mac]||'phone')??'';await api('POST',`/api/profiles/${id}/devices`,{mac,label});load()}
 async function discover(){const b=$('#scanbtn');b.disabled=true;b.textContent='Scanning…';
  try{const r=await api('POST','/api/discover');
   $('#scaninfo').textContent=`${r.devices.length} devices on ${r.subnet} · ${new Date().toLocaleTimeString()}`;
   const opts=profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
   $('#scan').innerHTML=r.devices.map(d=>`<div class="card row"><input type="checkbox" class="pick" value="${d.mac}" ${d.profile_id?'disabled':''}>
-   <span class="grow"><code>${d.mac}</code> <span class="mut">${esc(d.ip)}${d.hostname?' · '+esc(d.hostname):''}${d.private_mac?' · private MAC':''} · first seen ${date(d.first_seen)}</span>
+   <span class="grow">${nm(d)}<code>${d.mac}</code> <span class="mut">${esc(d.ip)}${d.hostname?' · '+esc(d.hostname):''}${d.private_mac?' · private MAC':''} · first seen ${date(d.first_seen)}</span>
    ${d.profile_id?`<br><span class="ok">${esc(d.profile_name)}${d.label?' · '+esc(d.label):''}</span>`:''}</span>
-   ${d.profile_id?'':`<input id="l${d.mac}" placeholder="Label" value="${esc((d.hostname||'').split('.')[0])}" style="width:120px">`}</div>`).join('')
+   ${d.profile_id?'':`<input id="l${d.mac}" placeholder="Label" value="${esc(d.name||(d.hostname||'').split('.')[0])}" style="width:120px">`}</div>`).join('')
    +(profiles.length?`<form onsubmit="addPicked(event)"><select id="pickp">${opts}</select><button class="pri">Add selected to profile</button></form>`:'<p class="mut">Create a profile first to assign devices.</p>');
  }finally{b.disabled=false;b.textContent='Scan now'}}
 async function addPicked(e){e.preventDefault();const id=$('#pickp').value,macs=[...document.querySelectorAll('.pick:checked')].map(c=>c.value);

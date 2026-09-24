@@ -36,6 +36,10 @@ class ProfileUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
+class NameIn(BaseModel):
+    name: str = Field("", max_length=100, description="Empty clears the name")
+
+
 class DiscoverIn(BaseModel):
     subnet: str = Field("", examples=["192.168.1.0/24"], description="Empty = OP_SUBNET or auto-detect")
 
@@ -75,12 +79,16 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
         if settings.api_key and x_api_key != settings.api_key:
             raise HTTPException(401, "invalid or missing X-API-Key")
 
+    def alias(mac):
+        r = db.q("SELECT name FROM aliases WHERE mac=?", (mac,)).fetchone()
+        return r["name"] if r else ""
+
     def device_info(mac, now, limit=0):
         s, events = db.history(mac, limit) if limit else (
             db.q("SELECT * FROM sightings WHERE mac=?", (mac,)).fetchone(), [])
         last = s["last_seen"] if s else None
         present = bool(last and now - last <= settings.present_timeout)
-        out = {"ip": s["ip"] if s else None, "first_seen": s["first_seen"] if s else None,
+        out = {"name": alias(mac), "ip": s["ip"] if s else None, "first_seen": s["first_seen"] if s else None,
                "last_seen": last, "present": present,
                "arrived_at": s["arrived_at"] if s and present else None}
         if limit:
@@ -106,7 +114,8 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
         owner = db.q("SELECT profile_id FROM devices WHERE mac=?", (d.mac,)).fetchone()
         if owner and owner["profile_id"] != pid:
             raise HTTPException(409, f"MAC {d.mac} already belongs to profile {owner['profile_id']}")
-        db.q("INSERT OR REPLACE INTO devices(mac, profile_id, label) VALUES(?,?,?)", (d.mac, pid, d.label))
+        db.q("INSERT OR REPLACE INTO devices(mac, profile_id, label) VALUES(?,?,?)",
+             (d.mac, pid, d.label or alias(d.mac)))
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -144,8 +153,24 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
         for d in res["devices"]:
             o = owners.get(d["mac"])
             d["profile_id"], d["profile_name"], d["label"] = o if o else (None, None, "")
+            d["name"] = alias(d["mac"])
             d["first_seen"] = db.q("SELECT first_seen FROM sightings WHERE mac=?", (d["mac"],)).fetchone()[0]
         return {"timestamp": time.time(), **res}
+
+    @app.put("/api/devices/{mac}/name", tags=["devices"], dependencies=[Depends(require_key)])
+    def set_name(mac: str, body: NameIn):
+        """Name any MAC, assigned to a profile or not. An empty name clears it."""
+        try:
+            mac = scanner.normalize_mac(mac)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        name = body.name.strip()
+        if name:
+            db.q("INSERT INTO aliases(mac, name) VALUES(?,?) ON CONFLICT(mac) DO UPDATE SET name=excluded.name",
+                 (mac, name))
+        else:
+            db.q("DELETE FROM aliases WHERE mac=?", (mac,))
+        return {"mac": mac, "name": name}
 
     @app.get("/api/devices/{mac}/history", tags=["devices"])
     def device_history(mac: str, limit: int = 50):
@@ -212,8 +237,8 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
     def unknown_devices(since: Optional[int] = None):
         """MACs seen on the network not assigned to any profile. `since` = seconds back (default: present timeout x 12)."""
         cutoff = time.time() - (since or settings.present_timeout * 12)
-        rows = db.q("""SELECT s.mac, s.ip, s.first_seen, s.last_seen FROM sightings s
-                       LEFT JOIN devices d ON d.mac=s.mac WHERE d.mac IS NULL AND s.last_seen>=?
+        rows = db.q("""SELECT s.mac, COALESCE(a.name, '') AS name, s.ip, s.first_seen, s.last_seen
+                       FROM sightings s LEFT JOIN devices d ON d.mac=s.mac LEFT JOIN aliases a ON a.mac=s.mac WHERE d.mac IS NULL AND s.last_seen>=?
                        ORDER BY s.last_seen DESC""", (cutoff,))
         return [dict(r) for r in rows]
 
