@@ -22,6 +22,18 @@ form{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}form input{flex:1;min-wi
 <div id="scan"></div>
 <h2>Unknown devices</h2><div id="unknown" class="mut"></div>
 <div id="ignwrap" hidden><h2>Ignored</h2><div id="ignored"></div></div>
+<h2>Eventos / OpenClaw</h2>
+<div class="card"><form id="ocf" style="margin:0">
+ <label class="row" style="width:100%"><input type="checkbox" name="enabled" style="flex:0"> Send arrival/departure events to OpenClaw</label>
+ <input name="url" placeholder="http://127.0.0.1:18789/hooks/agent" style="min-width:100%">
+ <input name="token" type="password" autocomplete="off" placeholder="Hook token">
+ <input name="agent_id" placeholder="agentId (optional)">
+ <input name="channel" placeholder="channel (optional)"><input name="to" placeholder="to (optional)">
+ <button class="pri">Save</button><button type="button" onclick="ocTest()">Send test</button>
+ <span class="mut" id="ocinfo" style="width:100%"></span></form></div>
+<div class="card"><b>Rules</b><div id="rules"></div>
+ <form id="rulef"><select name="profile_id" id="rulep"></select><select name="trigger"><option value="both">arrive + leave</option><option value="arrive">arrive</option><option value="leave">leave</option></select><button>Add rule</button></form></div>
+<details class="card"><summary>Recent deliveries</summary><div id="dels" class="mut"></div></details>
 <p class="mut"><span id="keyinfo"></span> · <a href="/docs">API docs</a></p>
 </main><script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
@@ -78,5 +90,19 @@ async function addPicked(e){e.preventDefault();const id=$('#pickp').value,macs=[
  await load();discover()}
 $('#newp').onsubmit=async e=>{e.preventDefault();await api('POST','/api/profiles',{name:e.target.name.value});e.target.reset();load()};
 fetch('/health').then(r=>r.json()).then(h=>$('#keyinfo').textContent=h.auth_required?'Editing requires API key':'Open editing (no API key set)');
-load();setInterval(load,15000);
+const TRIG={both:'arrive + leave',arrive:'arrive',leave:'leave'};
+async function ocLoad(){const [c,rs,ds]=await Promise.all([api('GET','/api/integrations/openclaw'),api('GET','/api/rules'),api('GET','/api/integrations/openclaw/deliveries')]);
+ const f=$('#ocf');f.enabled.checked=c.enabled;f.url.value=c.url;f.agent_id.value=c.agent_id;f.channel.value=c.channel;f.to.value=c.to;f.token.value='';
+ f.token.placeholder=c.token_source=='env'?`Token from OP_OPENCLAW_TOKEN (${c.token_masked})`:c.token_set?`Token saved (${c.token_masked}), type to replace`:'Hook token';
+ $('#rulep').innerHTML='<option value="">All profiles</option>'+profiles.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('');
+ $('#rules').innerHTML=rs.map(r=>`<div class="row"><label class="grow"><input type="checkbox" ${r.enabled?'checked':''} onchange="ruleToggle(${r.id},${r.profile_id??'null'},'${r.trigger}',this.checked)"> ${esc(r.profile_name||'All profiles')} · ${TRIG[r.trigger]}</label><button class="x" onclick="ruleDel(${r.id})">✕</button></div>`).join('')||'<span class="mut">No rules: nothing is sent.</span>';
+ $('#dels').innerHTML=ds.map(d=>`<div><span class="${d.ok?'ok':''}">${d.ok?'✓':'✗'}</span> ${date(d.ts)} · ${esc(d.message)} <span class="mut">${d.http_status??'no response'}${d.error?' · '+esc(d.error):''} · ${d.attempts} try</span></div>`).join('')||'None yet.'}
+$('#ocf').onsubmit=async e=>{e.preventDefault();const f=e.target,b={enabled:f.enabled.checked,url:f.url.value.trim(),agent_id:f.agent_id.value.trim(),channel:f.channel.value.trim(),to:f.to.value.trim()};
+ if(f.token.value)b.token=f.token.value;await api('PUT','/api/integrations/openclaw',b);$('#ocinfo').textContent='Saved.';ocLoad()};
+async function ocTest(){$('#ocinfo').textContent='Sending…';const r=await api('POST','/api/integrations/openclaw/test');
+ $('#ocinfo').textContent=r.ok?`Test delivered (HTTP ${r.delivery.http_status}).`:`Test failed: ${r.delivery.http_status??''} ${r.delivery.error}`;ocLoad()}
+$('#rulef').onsubmit=async e=>{e.preventDefault();const f=e.target;await api('POST','/api/rules',{profile_id:f.profile_id.value?+f.profile_id.value:null,trigger:f.trigger.value});ocLoad()};
+async function ruleToggle(id,pid,trigger,enabled){await api('PUT',`/api/rules/${id}`,{profile_id:pid,trigger,enabled});ocLoad()}
+async function ruleDel(id){await api('DELETE',`/api/rules/${id}`);ocLoad()}
+load().then(ocLoad);setInterval(load,15000);setInterval(()=>{if(!document.activeElement?.closest('#ocf'))ocLoad()},30000);
 </script></body></html>

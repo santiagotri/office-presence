@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import scanner
 from .config import Settings
 from .db import DB
+from .notify import DEFAULT_URL, Notifier
 
 log = logging.getLogger("office-presence")
 STATIC = Path(__file__).parent / "static"
@@ -40,20 +41,41 @@ class NameIn(BaseModel):
     name: str = Field("", max_length=100, description="Empty clears the name")
 
 
+class OpenClawIn(BaseModel):
+    enabled: bool = False
+    url: str = Field(DEFAULT_URL, max_length=500)
+    token: Optional[str] = Field(None, description="None/omitted keeps the stored token, '' clears it")
+    agent_id: str = Field("", max_length=100, description="OpenClaw agentId, empty = gateway default")
+    channel: str = Field("", max_length=100, description="Direct delivery channel (needs `to` too)")
+    to: str = Field("", max_length=200)
+
+
+class RuleIn(BaseModel):
+    profile_id: Optional[int] = Field(None, description="None = every profile")
+    trigger: str = Field("both", pattern="^(arrive|leave|both)$")
+    enabled: bool = True
+
+
 class DiscoverIn(BaseModel):
     subnet: str = Field("", examples=["192.168.1.0/24"], description="Empty = OP_SUBNET or auto-detect")
 
 
-def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=None, notifier=None) -> FastAPI:
     settings = settings or Settings()
     scan_fn = scan_fn or scanner.scan
     discover_fn = discover_fn or scanner.discover
     db = DB(settings.db_path)
+    notifier = notifier or Notifier(db)
     state = {"last_scan": None, "last_error": None}
+
+    def record(found):
+        db.record(found, timeout=settings.present_timeout)
+        for ev in db.profile_transitions():
+            notifier.submit(ev)  # queued; delivered on the notifier thread
 
     def do_scan():
         try:
-            db.record(scan_fn(settings), timeout=settings.present_timeout)
+            record(scan_fn(settings))
             state["last_scan"], state["last_error"] = time.time(), None
         except Exception as e:  # noqa: BLE001
             state["last_error"] = str(e)
@@ -73,7 +95,7 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
 
     app = FastAPI(title="Office Presence", version="1.0.0", lifespan=lifespan,
                   description="Who is in the office, detected by device MAC on the LAN.")
-    app.state.db, app.state.settings, app.state.do_scan = db, settings, do_scan
+    app.state.db, app.state.settings, app.state.do_scan, app.state.notifier = db, settings, do_scan, notifier
 
     def require_key(x_api_key: Optional[str] = Header(None)):
         if settings.api_key and x_api_key != settings.api_key:
@@ -149,7 +171,7 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
             raise HTTPException(500, f"scan failed: {e}")
         skip = db.ignored_macs()
         res["devices"] = [d for d in res["devices"] if d["mac"] not in skip]
-        db.record({d["mac"]: d["ip"] for d in res["devices"]}, timeout=settings.present_timeout)
+        record({d["mac"]: d["ip"] for d in res["devices"]})
         owners = {r["mac"]: (r["profile_id"], r["name"], r["label"]) for r in db.q(
             "SELECT d.mac, d.profile_id, d.label, p.name FROM devices d JOIN profiles p ON p.id=d.profile_id")}
         for d in res["devices"]:
@@ -275,6 +297,82 @@ def create_app(settings: Optional[Settings] = None, scan_fn=None, discover_fn=No
                        WHERE d.mac IS NULL AND s.mac NOT IN (SELECT mac FROM ignored) AND s.last_seen>=?
                        ORDER BY s.last_seen DESC""", (cutoff,))
         return [dict(r) for r in rows]
+
+    def oc_out():
+        c = notifier.config()
+        tok = c.pop("token", "") or ""
+        c["token_set"] = bool(tok)
+        c["token_masked"] = (tok[:3] + "…" + tok[-3:]) if len(tok) > 8 else ("•••" if tok else "")
+        c.setdefault("enabled", False)
+        for k in ("agent_id", "channel", "to"):
+            c.setdefault(k, "")
+        return c
+
+    @app.get("/api/integrations/openclaw", tags=["events"])
+    def get_openclaw():
+        """Webhook config. The token is never returned, only masked. OP_OPENCLAW_TOKEN overrides it."""
+        return oc_out()
+
+    @app.put("/api/integrations/openclaw", tags=["events"], dependencies=[Depends(require_key)])
+    def put_openclaw(body: OpenClawIn):
+        cur = db.integration("openclaw")
+        new = body.model_dump(exclude={"token"})
+        new["token"] = cur.get("token", "") if body.token is None else body.token.strip()
+        if bool(new["channel"]) != bool(new["to"]):
+            raise HTTPException(422, "channel and to must be set together (or both empty)")
+        db.set_integration("openclaw", new)
+        return oc_out()
+
+    @app.post("/api/integrations/openclaw/test", tags=["events"], dependencies=[Depends(require_key)])
+    async def test_openclaw():
+        """Send a test event synchronously and return the delivery result."""
+        cfg = notifier.config()
+        if not cfg.get("url"):
+            raise HTTPException(422, "no webhook URL configured")
+        ev = {"event": "test", "profile": "Prueba", "profile_id": None, "ts": time.time(), "devices": []}
+        ok = await asyncio.to_thread(notifier.deliver, cfg, ev)
+        last = db.q("SELECT * FROM deliveries ORDER BY id DESC LIMIT 1").fetchone()
+        return {"ok": ok, "delivery": dict(last)}
+
+    @app.get("/api/integrations/openclaw/deliveries", tags=["events"])
+    def deliveries(limit: int = 30):
+        return [dict(r) for r in db.q("SELECT * FROM deliveries ORDER BY id DESC LIMIT ?", (max(1, min(limit, 200)),))]
+
+    @app.get("/api/rules", tags=["events"])
+    def list_rules():
+        return [dict(r) for r in db.q("""SELECT r.*, p.name AS profile_name FROM notify_rules r
+                                         LEFT JOIN profiles p ON p.id=r.profile_id ORDER BY r.id""")]
+
+    def rule_check(body):
+        if body.profile_id is not None:
+            get_profile(body.profile_id)
+
+    @app.post("/api/rules", tags=["events"], status_code=201, dependencies=[Depends(require_key)])
+    def create_rule(body: RuleIn):
+        rule_check(body)
+        rid = db.q("INSERT INTO notify_rules(profile_id, trigger, enabled) VALUES(?,?,?)",
+                   (body.profile_id, body.trigger, int(body.enabled))).lastrowid
+        return dict(db.q("SELECT * FROM notify_rules WHERE id=?", (rid,)).fetchone())
+
+    @app.put("/api/rules/{rid}", tags=["events"], dependencies=[Depends(require_key)])
+    def update_rule(rid: int, body: RuleIn):
+        rule_check(body)
+        if db.q("UPDATE notify_rules SET profile_id=?, trigger=?, enabled=? WHERE id=?",
+                (body.profile_id, body.trigger, int(body.enabled), rid)).rowcount == 0:
+            raise HTTPException(404, "rule not found")
+        return dict(db.q("SELECT * FROM notify_rules WHERE id=?", (rid,)).fetchone())
+
+    @app.delete("/api/rules/{rid}", tags=["events"], status_code=204, dependencies=[Depends(require_key)])
+    def delete_rule(rid: int):
+        if db.q("DELETE FROM notify_rules WHERE id=?", (rid,)).rowcount == 0:
+            raise HTTPException(404, "rule not found")
+
+    @app.get("/api/profiles/{pid}/events", tags=["profiles"])
+    def profile_events(pid: int, limit: int = 50):
+        """Profile-level arrive/leave transitions (debounced across devices), newest first."""
+        get_profile(pid)
+        return [dict(r) for r in db.q("SELECT kind, ts FROM profile_events WHERE profile_id=? ORDER BY id DESC LIMIT ?",
+                                      (pid, max(1, min(limit, 500))))]
 
     return app
 

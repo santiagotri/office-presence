@@ -29,6 +29,27 @@ Every sighting updates `first_seen` / `last_seen`. A device **arrives** when see
 last sighting). The UI shows per device: *first seen <date>*, *present for <time since arrival>* or
 *missing for <time since last seen>*, and an expandable event log.
 
+## Eventos / OpenClaw
+A **profile** arrives when its first device shows up and leaves when its last device goes past
+`OP_PRESENT_TIMEOUT` (debounced across devices; log at `GET /api/profiles/{id}/events`). Matching
+events are pushed to OpenClaw's Gateway inbound webhook `POST /hooks/agent` on a background thread
+(5 s timeout, 3 tries on network/5xx/429, never blocks the scanner), with `Authorization: Bearer` and an
+`Idempotency-Key`.
+
+UI section *Eventos / OpenClaw*: enable, webhook URL (default `http://127.0.0.1:18789/hooks/agent`),
+token (masked; `OP_OPENCLAW_TOKEN` overrides), optional `agentId` and `channel`+`to` for direct delivery,
+rules (all profiles or one; arrive / leave / both; toggle), **Send test**, recent deliveries.
+API: `/api/integrations/openclaw` (GET/PUT), `/test`, `/deliveries`, `/api/rules` (CRUD).
+
+Payload `message` = Spanish line (`Ana llegó a la oficina (09:12).`) + `[office-presence]` + JSON
+`{source, event: arrive|leave|test, profile, profile_id, time (ISO), ts, devices:[{mac,label,present,ip}]}`.
+
+OpenClaw config (`openclaw config validate && openclaw gateway restart`):
+```json5
+{ hooks: { enabled: true, token: "<long-random-hook-token>", path: "/hooks",
+           allowedAgentIds: ["main"], allowRequestSessionKey: false } }
+```
+
 ## Config (env vars)
 | Var | Default | Meaning |
 |---|---|---|
@@ -37,6 +58,7 @@ last sighting). The UI shows per device: *first seen <date>*, *present for <time
 | `OP_PRESENT_TIMEOUT` | `300` | seconds since last sighting to count as present |
 | `OP_SUBNET` | *(empty)* | CIDR to sweep, e.g. `192.168.1.0/24` (max /22). Empty = background scans only read the ARP table; **Scan now** auto-detects |
 | `OP_PING_SWEEP` | `1` | ping every host in `OP_SUBNET` before reading the table |
+| `OP_OPENCLAW_TOKEN` | *(empty)* | OpenClaw hook token, overrides the one saved in the UI |
 | `OP_USE_SCAPY` | `0` | active ARP scan (`pip install scapy`, needs root) |
 | `OP_API_KEY` | *(empty)* | if set, all write endpoints require header `X-API-Key` |
 | `OP_SCANNER` | `1` | set `0` to disable background scanning |

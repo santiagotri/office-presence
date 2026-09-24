@@ -205,3 +205,136 @@ def test_ignored_migration(tmp_path):
     with TestClient(app) as cl:
         assert cl.delete("/api/devices/aa:bb:cc:dd:ee:01?ignore=true").status_code == 204
         assert cl.get("/api/devices/ignored").json()[0]["mac"] == "aa:bb:cc:dd:ee:01"
+
+
+# ---- OpenClaw events ----
+import json as _json
+import threading as _th
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+@pytest.fixture
+def hook():
+    got = {"reqs": [], "codes": []}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = _json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            got["reqs"].append({"path": self.path, "auth": self.headers.get("Authorization"),
+                                "idem": self.headers.get("Idempotency-Key"), "body": body})
+            code = got["codes"].pop(0) if got["codes"] else 200
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"runId":"r1"}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    got["url"] = f"http://127.0.0.1:{srv.server_port}/hooks/agent"
+    yield got
+    srv.shutdown()
+
+
+def _wait(c):
+    c.app_ref.state.notifier.q.join()
+
+
+def _setup(client, hook, trigger="both", pid=None):
+    client.app_ref.state.notifier.backoff = 0
+    client.put("/api/integrations/openclaw", json={"enabled": True, "url": hook["url"], "token": "s3cret-token-xyz"})
+    client.post("/api/rules", json={"profile_id": pid, "trigger": trigger})
+
+
+def test_openclaw_config_masks_token(client, hook, monkeypatch):
+    r = client.put("/api/integrations/openclaw", json={"enabled": True, "url": hook["url"], "token": "abcdefghijkl"}).json()
+    assert "token" not in r and r["token_set"] and r["token_masked"] == "abc…jkl" and r["token_source"] == "db"
+    r = client.put("/api/integrations/openclaw", json={"enabled": True, "url": hook["url"]}).json()
+    assert r["token_set"]  # omitted token keeps the stored one
+    monkeypatch.setenv("OP_OPENCLAW_TOKEN", "fromenv-123456")
+    assert client.get("/api/integrations/openclaw").json()["token_source"] == "env"
+    client.post("/api/integrations/openclaw/test")
+    assert hook["reqs"][-1]["auth"] == "Bearer fromenv-123456"
+    assert client.put("/api/integrations/openclaw", json={"url": hook["url"], "channel": "telegram"}).status_code == 422
+
+
+def test_profile_events_debounced_and_pushed(client, hook):
+    pid = client.post("/api/profiles", json={"name": "Ana", "devices": [
+        {"mac": "aa:bb:cc:dd:ee:01"}, {"mac": "aa:bb:cc:dd:ee:02"}]}).json()["id"]
+    _setup(client, hook)
+    app = client.app_ref
+    app.state.do_scan()  # initialises state silently (absent)
+    FOUND["aa:bb:cc:dd:ee:01"] = "10.0.0.5"
+    app.state.do_scan()
+    FOUND["aa:bb:cc:dd:ee:02"] = "10.0.0.6"  # second device: no new profile event
+    app.state.do_scan()
+    _wait(client)
+    assert len(hook["reqs"]) == 1
+    req = hook["reqs"][0]
+    assert req["path"] == "/hooks/agent" and req["auth"] == "Bearer s3cret-token-xyz" and req["idem"]
+    assert req["body"]["name"] == "office-presence" and "channel" not in req["body"]
+    assert req["body"]["message"].startswith("Ana llegó a la oficina")
+    data = _json.loads(req["body"]["message"].split("[office-presence]\n", 1)[1])
+    assert data["event"] == "arrive" and data["profile"] == "Ana" and len(data["devices"]) == 2
+    # both devices gone past the timeout -> one leave
+    db = app.state.db
+    db.q("UPDATE sightings SET last_seen=last_seen-1000")
+    FOUND.clear()
+    app.state.do_scan()
+    _wait(client)
+    assert len(hook["reqs"]) == 2 and "salió de la oficina" in hook["reqs"][1]["body"]["message"]
+    ev = client.get(f"/api/profiles/{pid}/events").json()
+    assert [e["kind"] for e in ev] == ["leave", "arrive"]
+    d = client.get("/api/integrations/openclaw/deliveries").json()
+    assert len(d) == 2 and all(x["ok"] for x in d)
+
+
+def test_rules_filter(client, hook):
+    a = client.post("/api/profiles", json={"name": "Ana", "devices": [{"mac": "aa:bb:cc:dd:ee:01"}]}).json()["id"]
+    client.post("/api/profiles", json={"name": "Bo", "devices": [{"mac": "aa:bb:cc:dd:ee:02"}]})
+    _setup(client, hook, trigger="leave", pid=a)
+    app = client.app_ref
+    app.state.do_scan()
+    FOUND.update({"aa:bb:cc:dd:ee:01": "1", "aa:bb:cc:dd:ee:02": "2"})
+    app.state.do_scan()
+    _wait(client)
+    assert hook["reqs"] == []  # arrivals don't match a leave-only rule
+    app.state.db.q("UPDATE sightings SET last_seen=last_seen-1000")
+    FOUND.clear()
+    app.state.do_scan()
+    _wait(client)
+    assert len(hook["reqs"]) == 1 and hook["reqs"][0]["body"]["message"].startswith("Ana salió")
+    rid = client.get("/api/rules").json()[0]["id"]
+    client.put(f"/api/rules/{rid}", json={"profile_id": a, "trigger": "both", "enabled": False})
+    FOUND["aa:bb:cc:dd:ee:01"] = "1"
+    app.state.do_scan()
+    _wait(client)
+    assert len(hook["reqs"]) == 1  # disabled rule
+
+
+def test_retry_and_failure_log(client, hook):
+    _setup(client, hook)
+    hook["codes"] = [503, 200]
+    r = client.post("/api/integrations/openclaw/test").json()
+    assert r["ok"] and r["delivery"]["attempts"] == 2
+    hook["codes"] = [401]
+    r = client.post("/api/integrations/openclaw/test").json()
+    assert not r["ok"] and r["delivery"]["attempts"] == 1 and r["delivery"]["http_status"] == 401
+    client.put("/api/integrations/openclaw", json={"enabled": True, "url": "http://127.0.0.1:9/hooks/agent"})
+    r = client.post("/api/integrations/openclaw/test").json()
+    assert not r["ok"] and r["delivery"]["http_status"] is None and r["delivery"]["attempts"] == 3
+
+
+def test_scanner_never_blocks_on_hook(client):
+    import time as _t
+    pid = client.post("/api/profiles", json={"name": "Ana", "devices": [{"mac": "aa:bb:cc:dd:ee:01"}]}).json()["id"]
+    client.put("/api/integrations/openclaw", json={"enabled": True, "url": "http://10.255.255.1:18789/hooks/agent"})
+    client.post("/api/rules", json={"profile_id": pid, "trigger": "both"})
+    app = client.app_ref
+    app.state.do_scan()
+    FOUND["aa:bb:cc:dd:ee:01"] = "1"
+    t0 = _t.time()
+    app.state.do_scan()
+    assert _t.time() - t0 < 1
